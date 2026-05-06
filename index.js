@@ -797,11 +797,11 @@ function buildStaffSessionVoteComponents(voteCount = 0) {
           content:
             '# Staff Session Vote\n' +
             'Staff members may vote below to decide if a roleplay session should begin.\n\n' +
-            ':redbulletpoint: This vote is for staff only and is available in this channel\n' +
-            ':redbulletpoint: If you vote here, you must also vote in the Community Session Vote\n' +
-            ':redbulletpoint: Vote based on staff availability and server readiness\n' +
-            ':redbulletpoint: Once enough votes are reached, a decision will be made\n' +
-            ':redbulletpoint: If passed, a session will begin shortly\n' +
+            '<:redbulletpoint:1500566566335549580> This vote is for staff only and is available in this channel\n' +
+            '<:redbulletpoint:1500566566335549580> If you vote here, you must also vote in the Community Session Vote\n' +
+            '<:redbulletpoint:1500566566335549580> Vote based on staff availability and server readiness\n' +
+            '<:redbulletpoint:1500566566335549580> Once enough votes are reached, a decision will be made\n' +
+            '<:redbulletpoint:1500566566335549580> If passed, a session will begin shortly\n' +
             '_ _\n' +
             '-# Staff members use this vote to decide if a roleplay session should begin based on availability and server readiness. Cast your vote below, and once enough votes are reached, the result will determine if a session starts.'
         },
