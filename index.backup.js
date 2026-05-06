@@ -51,6 +51,9 @@ const SESSION_NOTIFIER_ROLE_ID = '1496004269093158963';
 const STAFF_SESSION_ROLE_ID = '1496648446604742656';
 const STAFF_SESSION_VOTE_CHANNEL_ID = '1501630953297281227';
 
+const SESSION_FULL_CHANNEL_ID = '1496043756267241562';
+const SSD_LOCK_CHANNEL_ID = '1499824302504153188';
+
 const INFRACTION_PERMISSION_ROLE_ID = '1497383043026124951';
 const SAY_PERMISSION_ROLE_ID = '1496645982824300654';
 const PROMOTION_PERMISSION_ROLE_ID = '1497391949827674213';
@@ -89,6 +92,9 @@ const STARTUP_BANNER_URL =
 
 const STAFF_SESSION_VOTE_BANNER =
   'https://media.discordapp.net/attachments/1393378962364956783/1393379364783128596/59.png?ex=69fc7ce8&is=69fb2b68&hm=073ed133a1a7800535f7aba90001ac56fb936bb581e9723d9ec22d1a43d9f508&=&format=webp&quality=lossless&width=1428&height=338';
+
+const SESSION_FULL_IMAGE =
+  'https://media.discordapp.net/attachments/1393378962364956783/1393379706010603561/minstate.png?ex=69fc7d39&is=69fb2bb9&hm=ec97ad362f11aa95549e8126fcfeb1cf05c046f3648bd4bdf38dcaf1d82f409c&=&format=webp&quality=lossless&width=1428&height=72';
 
 const INFO_TOP_IMAGE_URL = STARTUP_BANNER_URL;
 const INFO_BOTTOM_IMAGE_URL = SHUTDOWN_BANNER_URL;
@@ -187,8 +193,12 @@ const REACTION_ROLES = {
 };
 
 const SUPPORT_ROLE_IDS = Object.values(TICKET_TYPES).map(t => t.supportRoleId);
+
 const activeStartupVotes = new Map();
 const activeStaffSessionVotes = new Map();
+
+let sessionFullSent = false;
+let ssdLockedSent = false;
 
 client.once(Events.ClientReady, async readyClient => {
   console.log(`Logged in as ${readyClient.user.tag}`);
@@ -196,7 +206,7 @@ client.once(Events.ClientReady, async readyClient => {
   await registerSlashCommands().catch(console.error);
 
   await updatePermanentInfoMessage().catch(console.error);
-  setInterval(() => updatePermanentInfoMessage().catch(console.error), 60_000);
+  setInterval(() => updatePermanentInfoMessage().catch(console.error), 30_000);
 
   await checkGiveawayEnds().catch(console.error);
   setInterval(() => checkGiveawayEnds().catch(console.error), 15_000);
@@ -498,6 +508,80 @@ function pickRandomWinners(entries, count) {
   return shuffled.slice(0, Math.min(count, shuffled.length));
 }
 
+function buildSessionFullComponents() {
+  return [
+    {
+      type: 17,
+      components: [
+        {
+          type: 10,
+          content:
+            '## Full Session!\n' +
+            'Thank you all for getting us to a full server, we really appreciate the support and activity!\n' +
+            'If you are trying to join, hang tight, spots usually open up soon. We are glad to have such an active community!\n' +
+            `**Full Since:** <t:${Math.floor(Date.now() / 1000)}:F>`
+        },
+        { type: 14, spacing: 1 },
+        {
+          type: 12,
+          items: [{ media: { url: SESSION_FULL_IMAGE } }]
+        }
+      ],
+      accent_color: 10693933
+    }
+  ];
+}
+
+function buildSSDEmbed() {
+  return new EmbedBuilder()
+    .setColor(10693933)
+    .setDescription('🔒 **SSD**\n\nThe server has reached **0 players in-game**, so this channel has been locked.');
+}
+
+async function handlePlayerAutomation(players) {
+  const guild = await client.guilds.fetch(GUILD_ID).catch(() => null);
+  if (!guild) return;
+
+  if (players >= 39 && !sessionFullSent) {
+    const fullChannel = await client.channels.fetch(SESSION_FULL_CHANNEL_ID).catch(() => null);
+
+    if (fullChannel && fullChannel.isTextBased()) {
+      await client.rest.post(Routes.channelMessages(fullChannel.id), {
+        body: {
+          flags: IS_COMPONENTS_V2,
+          components: buildSessionFullComponents()
+        }
+      }).catch(console.error);
+    }
+
+    sessionFullSent = true;
+  }
+
+  if (players < 39) {
+    sessionFullSent = false;
+  }
+
+  if (players === 0 && !ssdLockedSent) {
+    const lockChannel = await guild.channels.fetch(SSD_LOCK_CHANNEL_ID).catch(() => null);
+
+    if (lockChannel && lockChannel.isTextBased()) {
+      await lockChannel.permissionOverwrites.edit(guild.id, {
+        SendMessages: false
+      }).catch(console.error);
+
+      await lockChannel.send({
+        embeds: [buildSSDEmbed()]
+      }).catch(console.error);
+    }
+
+    ssdLockedSent = true;
+  }
+
+  if (players > 0) {
+    ssdLockedSent = false;
+  }
+}
+
 function buildGiveawayComponents(giveaway) {
   const ended = giveaway.ended || Date.now() >= giveaway.endsAt;
   const winnerText = ended
@@ -780,18 +864,9 @@ function buildStaffSessionVoteComponents(voteCount = 0) {
       components: [
         {
           type: 12,
-          items: [
-            {
-              media: {
-                url: STAFF_SESSION_VOTE_BANNER
-              }
-            }
-          ]
+          items: [{ media: { url: STAFF_SESSION_VOTE_BANNER } }]
         },
-        {
-          type: 14,
-          spacing: 2
-        },
+        { type: 14, spacing: 2 },
         {
           type: 10,
           content:
@@ -805,10 +880,7 @@ function buildStaffSessionVoteComponents(voteCount = 0) {
             '_ _\n' +
             '-# Staff members use this vote to decide if a roleplay session should begin based on availability and server readiness. Cast your vote below, and once enough votes are reached, the result will determine if a session starts.'
         },
-        {
-          type: 14,
-          spacing: 1
-        },
+        { type: 14, spacing: 1 },
         {
           type: 1,
           components: [
@@ -866,9 +938,7 @@ async function handleStaffSessionVoteCommand(interaction) {
     body: {
       flags: IS_COMPONENTS_V2,
       components: buildStaffSessionVoteComponents(0),
-      allowed_mentions: {
-        parse: ['roles']
-      }
+      allowed_mentions: { parse: ['roles'] }
     }
   });
 
@@ -2118,6 +2188,8 @@ async function updatePermanentInfoMessage() {
   ]);
 
   const players = Number(erlcData.CurrentPlayers ?? 0);
+  await handlePlayerAutomation(players);
+
   const maxPlayers = Number(erlcData.MaxPlayers ?? 40);
 
   let queue = 0;
