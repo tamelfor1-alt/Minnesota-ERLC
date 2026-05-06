@@ -199,6 +199,8 @@ const activeStaffSessionVotes = new Map();
 
 let sessionFullSent = false;
 let ssdLockedSent = false;
+let ssuOnlineSent = false;
+let lastLockMessageId = null;
 
 client.once(Events.ClientReady, async readyClient => {
   console.log(`Logged in as ${readyClient.user.tag}`);
@@ -538,13 +540,24 @@ function buildSSDEmbed() {
     .setDescription('🔒 **SSD**\n\nThe server has reached **0 players in-game**, so this channel has been locked.');
 }
 
+function buildSSUOnlineEmbed() {
+  return new EmbedBuilder()
+    .setColor(10693933)
+    .setDescription(
+      '🟢 **Server Online**\n\n' +
+      'The server is now online and game chat has been unlocked.\n' +
+      'You may now chat and join the session.'
+    );
+}
+
 async function handlePlayerAutomation(players) {
   const guild = await client.guilds.fetch(GUILD_ID).catch(() => null);
   if (!guild) return;
 
-  if (players >= 39 && !sessionFullSent) {
-    const fullChannel = await client.channels.fetch(SESSION_FULL_CHANNEL_ID).catch(() => null);
+  const lockChannel = await guild.channels.fetch(SSD_LOCK_CHANNEL_ID).catch(() => null);
+  const fullChannel = await guild.channels.fetch(SESSION_FULL_CHANNEL_ID).catch(() => null);
 
+  if (players >= 39 && !sessionFullSent) {
     if (fullChannel && fullChannel.isTextBased()) {
       await client.rest.post(Routes.channelMessages(fullChannel.id), {
         body: {
@@ -561,24 +574,46 @@ async function handlePlayerAutomation(players) {
     sessionFullSent = false;
   }
 
-  if (players === 0 && !ssdLockedSent) {
-    const lockChannel = await guild.channels.fetch(SSD_LOCK_CHANNEL_ID).catch(() => null);
+  if (players >= 3 && !ssuOnlineSent) {
+    if (lockChannel && lockChannel.isTextBased()) {
+      await lockChannel.permissionOverwrites.edit(guild.id, {
+        SendMessages: true
+      }).catch(console.error);
 
+      if (lastLockMessageId) {
+        const oldMsg = await lockChannel.messages.fetch(lastLockMessageId).catch(() => null);
+        if (oldMsg) await oldMsg.delete().catch(() => {});
+        lastLockMessageId = null;
+      }
+
+      await lockChannel.send({
+        embeds: [buildSSUOnlineEmbed()]
+      }).catch(console.error);
+    }
+
+    ssuOnlineSent = true;
+    ssdLockedSent = false;
+  }
+
+  if (players < 3) {
+    ssuOnlineSent = false;
+  }
+
+  if (players === 0 && !ssdLockedSent) {
     if (lockChannel && lockChannel.isTextBased()) {
       await lockChannel.permissionOverwrites.edit(guild.id, {
         SendMessages: false
       }).catch(console.error);
 
-      await lockChannel.send({
+      const msg = await lockChannel.send({
         embeds: [buildSSDEmbed()]
-      }).catch(console.error);
+      }).catch(() => null);
+
+      if (msg) lastLockMessageId = msg.id;
     }
 
     ssdLockedSent = true;
-  }
-
-  if (players > 0) {
-    ssdLockedSent = false;
+    ssuOnlineSent = false;
   }
 }
 
@@ -2656,8 +2691,12 @@ async function handleSlashBoost(interaction) {
   await interaction.reply({ content: 'Boost sent.', ephemeral: true });
 
   await interaction.channel.send({
+    content: `<@&${SESSION_NOTIFIER_ROLE_ID}>`,
     embeds: [buildBoostEmbed()],
-    components: [buildJoinButtonRow()]
+    components: [buildJoinButtonRow()],
+    allowedMentions: {
+      roles: [SESSION_NOTIFIER_ROLE_ID]
+    }
   });
 }
 
