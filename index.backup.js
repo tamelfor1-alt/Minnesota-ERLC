@@ -3,6 +3,7 @@ require('dotenv').config();
 
 const fs = require('fs');
 const path = require('path');
+const { createTranscript } = require('discord-html-transcripts');
 
 const {
   Client,
@@ -17,7 +18,8 @@ const {
   PermissionFlagsBits,
   ModalBuilder,
   TextInputBuilder,
-  TextInputStyle
+  TextInputStyle,
+  AttachmentBuilder
 } = require('discord.js');
 
 const client = new Client({
@@ -75,6 +77,9 @@ const SUGGESTION_YES_EMOJI_ID = '1499581956201906326';
 const SUGGESTION_NO_EMOJI_ID = '1497029553158357074';
 
 const STAFF_FEEDBACK_CHANNEL_ID = '1499785829235556555';
+
+const TRANSCRIPT_LOG_CHANNEL_ID = '1502798480891183224';
+const TRANSCRIPTS_DIR = path.join(__dirname, 'transcripts');
 
 const RULES_CHANNEL_LINK =
   'https://discord.com/channels/1495947674107777064/1496353783717036173';
@@ -226,6 +231,13 @@ async function registerSlashCommands() {
     { name: 'startupvote', description: 'Start a community session vote.' },
     { name: 'boost', description: 'Send a session boost message.' },
     { name: 'staffsessionvote', description: 'Start a staff session vote.' },
+    {
+      name: 'close',
+      description: 'Close the current ticket and create a transcript.',
+      options: [
+        { name: 'reason', description: 'Reason for closing this ticket.', type: 3, required: true }
+      ]
+    },
     {
       name: 'infract',
       description: 'Issue an infraction to a user.',
@@ -617,6 +629,158 @@ async function handlePlayerAutomation(players) {
   }
 }
 
+/*
+  Transcript system:
+  - Creates a complete HTML transcript using discord-html-transcripts
+  - Saves the HTML file inside /transcripts
+  - Sends the transcript to the logs channel
+  - DMs the ticket creator with open time, close time, close reason, and the HTML transcript
+  - Deletes the ticket channel after a short delay
+*/
+async function closeTicketWithTranscript(interaction, reason) {
+  const channel = interaction.channel;
+  const ticketInfo = getTicketInfoFromChannel(channel);
+
+  if (!ticketInfo.ownerId || !ticketInfo.type) {
+    await interaction.reply({
+      content: 'This command can only be used inside a ticket channel.',
+      ephemeral: true
+    });
+    return;
+  }
+
+  if (!canUseTicketCommand(interaction, ticketInfo)) {
+    await interaction.reply({
+      content: 'You do not have permission to close this ticket.',
+      ephemeral: true
+    });
+    return;
+  }
+
+  await interaction.reply({
+    content: 'Closing ticket and generating transcript...',
+    ephemeral: true
+  });
+
+  await generateTranscriptAndCloseChannel({
+    channel,
+    guild: interaction.guild,
+    closedBy: interaction.user,
+    ticketInfo,
+    reason
+  });
+}
+
+/*
+  Generates transcript and sends it to staff logs and the ticket owner.
+  The transcript includes usernames, timestamps, messages, and attachments.
+*/
+async function generateTranscriptAndCloseChannel({ channel, guild, closedBy, ticketInfo, reason }) {
+  const openedAt = Number(ticketInfo.openedAt || channel.createdTimestamp || Date.now());
+  const closedAt = Date.now();
+
+  if (!fs.existsSync(TRANSCRIPTS_DIR)) {
+    fs.mkdirSync(TRANSCRIPTS_DIR, { recursive: true });
+  }
+
+  const safeChannelName = channel.name.replace(/[^a-zA-Z0-9-_]/g, '-');
+  const transcriptFileName = `${safeChannelName}-${channel.id}.html`;
+  const transcriptFilePath = path.join(TRANSCRIPTS_DIR, transcriptFileName);
+
+  let transcriptBuffer;
+
+  try {
+    transcriptBuffer = await createTranscript(channel, {
+      limit: -1,
+      returnType: 'buffer',
+      filename: transcriptFileName,
+      saveImages: true,
+      poweredBy: false
+    });
+  } catch (error) {
+    console.error('Transcript creation failed:', error);
+    transcriptBuffer = Buffer.from(
+      `<html><body><h1>Transcript Failed</h1><p>Could not create transcript for ${channel.name}.</p></body></html>`
+    );
+  }
+
+  fs.writeFileSync(transcriptFilePath, transcriptBuffer);
+
+  const transcriptEmbed = new EmbedBuilder()
+    .setColor('#da242e')
+    .setTitle('Ticket Transcript')
+    .addFields(
+      { name: 'Ticket Channel:', value: `${channel.name}`, inline: true },
+      { name: 'Ticket Creator:', value: `<@${ticketInfo.ownerId}>`, inline: true },
+      { name: 'Closed By:', value: `${closedBy}`, inline: true },
+      { name: 'Opened:', value: `<t:${Math.floor(openedAt / 1000)}:F>`, inline: true },
+      { name: 'Closed:', value: `<t:${Math.floor(closedAt / 1000)}:F>`, inline: true },
+      { name: 'Reason:', value: reason || 'No reason provided.', inline: false }
+    );
+
+  const logsChannel = await client.channels.fetch(TRANSCRIPT_LOG_CHANNEL_ID).catch(() => null);
+
+  if (logsChannel && logsChannel.isTextBased()) {
+    await logsChannel.send({
+      embeds: [transcriptEmbed],
+      files: [new AttachmentBuilder(transcriptFilePath, { name: transcriptFileName })]
+    }).catch(console.error);
+  }
+
+  const ticketCreator = await client.users.fetch(ticketInfo.ownerId).catch(() => null);
+
+  if (ticketCreator) {
+    const dmEmbed = new EmbedBuilder()
+      .setColor('#da242e')
+      .setTitle('Your Ticket Has Been Closed')
+      .setDescription('Your ticket has been closed. A transcript of the ticket is attached below.')
+      .addFields(
+        { name: 'Opened:', value: `<t:${Math.floor(openedAt / 1000)}:F>`, inline: true },
+        { name: 'Closed:', value: `<t:${Math.floor(closedAt / 1000)}:F>`, inline: true },
+        { name: 'Closed By:', value: `${closedBy}`, inline: true },
+        { name: 'Reason:', value: reason || 'No reason provided.', inline: false }
+      );
+
+    await ticketCreator.send({
+      embeds: [dmEmbed],
+      files: [new AttachmentBuilder(transcriptFilePath, { name: transcriptFileName })]
+    }).catch(() => {});
+  }
+
+  await channel.send({
+    embeds: [
+      buildPromptEmbed(
+        'Ticket Closed',
+        `This ticket has been closed by ${closedBy}.\n\n**Reason:** ${reason || 'No reason provided.'}\n\nTranscript has been saved. This channel will be deleted shortly.`
+      )
+    ]
+  }).catch(() => {});
+
+  setTimeout(() => {
+    channel.delete().catch(console.error);
+  }, 5000);
+}
+
+function buildCloseTicketModal() {
+  const modal = new ModalBuilder()
+    .setCustomId('ticket_close_modal')
+    .setTitle('Close Ticket');
+
+  const reasonInput = new TextInputBuilder()
+    .setCustomId('close_reason')
+    .setLabel('Reason for closing this ticket')
+    .setPlaceholder('Explain why this ticket is being closed.')
+    .setStyle(TextInputStyle.Paragraph)
+    .setRequired(true)
+    .setMaxLength(1000);
+
+  modal.addComponents(
+    new ActionRowBuilder().addComponents(reasonInput)
+  );
+
+  return modal;
+}
+
 function buildGiveawayComponents(giveaway) {
   const ended = giveaway.ended || Date.now() >= giveaway.endsAt;
   const winnerText = ended
@@ -907,11 +1071,11 @@ function buildStaffSessionVoteComponents(voteCount = 0) {
           content:
             '# Staff Session Vote\n' +
             'Staff members may vote below to decide if a roleplay session should begin.\n\n' +
-            '<:redbulletpoint:1500566566335549580> This vote is for staff only and is available in this channel\n' +
-            '<:redbulletpoint:1500566566335549580> If you vote here, you must also vote in the Community Session Vote\n' +
-            '<:redbulletpoint:1500566566335549580> Vote based on staff availability and server readiness\n' +
-            '<:redbulletpoint:1500566566335549580> Once enough votes are reached, a decision will be made\n' +
-            '<:redbulletpoint:1500566566335549580> If passed, a session will begin shortly\n' +
+            ':redbulletpoint: This vote is for staff only and is available in this channel\n' +
+            ':redbulletpoint: If you vote here, you must also vote in the Community Session Vote\n' +
+            ':redbulletpoint: Vote based on staff availability and server readiness\n' +
+            ':redbulletpoint: Once enough votes are reached, a decision will be made\n' +
+            ':redbulletpoint: If passed, a session will begin shortly\n' +
             '_ _\n' +
             '-# Staff members use this vote to decide if a roleplay session should begin based on availability and server readiness. Cast your vote below, and once enough votes are reached, the result will determine if a session starts.'
         },
@@ -2247,16 +2411,18 @@ function getTicketInfoFromChannel(channel) {
   const ownerMatch = topic.match(/ticketOwner:(\d+)/);
   const typeMatch = topic.match(/ticketType:([a-z]+)/);
   const claimedMatch = topic.match(/claimedBy:(\d+|none)/);
+  const openedAtMatch = topic.match(/openedAt:(\d+)/);
 
   return {
     ownerId: ownerMatch ? ownerMatch[1] : null,
     type: typeMatch ? typeMatch[1] : null,
-    claimedBy: claimedMatch ? claimedMatch[1] : 'none'
+    claimedBy: claimedMatch ? claimedMatch[1] : 'none',
+    openedAt: openedAtMatch ? openedAtMatch[1] : null
   };
 }
 
-function buildTicketTopic(ownerId, type, claimedBy = 'none') {
-  return `ticketOwner:${ownerId} | ticketType:${type} | claimedBy:${claimedBy}`;
+function buildTicketTopic(ownerId, type, claimedBy = 'none', openedAt = Date.now()) {
+  return `ticketOwner:${ownerId} | ticketType:${type} | claimedBy:${claimedBy} | openedAt:${openedAt}`;
 }
 
 async function findExistingTicket(guild, userId) {
@@ -2321,12 +2487,13 @@ async function createTicketFromModal(interaction) {
   const issueDetails = interaction.fields.getTextInputValue('issue_details');
 
   const safeName = interaction.user.username.toLowerCase().replace(/[^a-z0-9]/g, '-').slice(0, 20);
+  const openedAt = Date.now();
 
   const ticketChannel = await interaction.guild.channels.create({
     name: `ticket-${safeName}`,
     type: ChannelType.GuildText,
     parent: config.categoryId,
-    topic: buildTicketTopic(interaction.user.id, ticketType),
+    topic: buildTicketTopic(interaction.user.id, ticketType, 'none', openedAt),
     permissionOverwrites: [
       { id: interaction.guild.id, deny: [PermissionFlagsBits.ViewChannel] },
       {
@@ -2476,7 +2643,7 @@ async function handleClaimTicket(interaction) {
     ReadMessageHistory: true
   });
 
-  await channel.setTopic(buildTicketTopic(ticketInfo.ownerId, ticketInfo.type, interaction.user.id));
+  await channel.setTopic(buildTicketTopic(ticketInfo.ownerId, ticketInfo.type, interaction.user.id, ticketInfo.openedAt || Date.now()));
   await updateTicketButtons(channel, { closed: false, claimed: true });
 
   await interaction.reply({ embeds: [buildPromptEmbed('Ticket Claimed', `This ticket has been claimed by ${interaction.user}.`)] });
@@ -2511,7 +2678,7 @@ async function handleUnclaimTicket(interaction) {
     ManageMessages: true
   });
 
-  await channel.setTopic(buildTicketTopic(ticketInfo.ownerId, ticketInfo.type, 'none'));
+  await channel.setTopic(buildTicketTopic(ticketInfo.ownerId, ticketInfo.type, 'none', ticketInfo.openedAt || Date.now()));
   await updateTicketButtons(channel, { closed: false, claimed: false });
 
   await interaction.reply({ embeds: [buildPromptEmbed('Ticket Unclaimed', `This ticket has been unclaimed by ${interaction.user}.`)] });
@@ -2525,21 +2692,12 @@ async function handleCloseTicket(interaction) {
     return;
   }
 
-  if (!isTicketStaff(interaction.member)) {
-    await interaction.reply({ content: 'Only support staff can close tickets.', ephemeral: true });
+  if (!canUseTicketCommand(interaction, ticketInfo)) {
+    await interaction.reply({ content: 'You do not have permission to close this ticket.', ephemeral: true });
     return;
   }
 
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('ticket_confirm_close').setLabel('Confirm Close').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('ticket_cancel_action').setLabel('Cancel').setStyle(ButtonStyle.Secondary)
-  );
-
-  await interaction.reply({
-    embeds: [buildPromptEmbed('Close Ticket', 'Are you sure you want to close this ticket? The ticket creator will lose access, but staff can reopen it later.')],
-    components: [row],
-    ephemeral: true
-  });
+  await interaction.showModal(buildCloseTicketModal());
 }
 
 async function handleOpenTicket(interaction) {
@@ -2569,7 +2727,7 @@ async function handleOpenTicket(interaction) {
     ManageMessages: true
   });
 
-  await interaction.channel.setTopic(buildTicketTopic(ticketInfo.ownerId, ticketInfo.type, 'none'));
+  await interaction.channel.setTopic(buildTicketTopic(ticketInfo.ownerId, ticketInfo.type, 'none', ticketInfo.openedAt || Date.now()));
   await interaction.channel.setName(`ticket-${interaction.channel.name.replace(/^ticket-|^closed-/, '')}`).catch(() => {});
   await updateTicketButtons(interaction.channel, { closed: false, claimed: false });
 
@@ -2584,44 +2742,20 @@ async function handleDeleteTicket(interaction) {
     return;
   }
 
-  if (!isTicketStaff(interaction.member)) {
-    await interaction.reply({ content: 'Only support staff can delete tickets.', ephemeral: true });
+  if (!canUseTicketCommand(interaction, ticketInfo)) {
+    await interaction.reply({ content: 'You do not have permission to delete this ticket.', ephemeral: true });
     return;
   }
 
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('ticket_confirm_delete').setLabel('Confirm Delete').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('ticket_cancel_action').setLabel('Cancel').setStyle(ButtonStyle.Secondary)
-  );
-
-  await interaction.reply({
-    embeds: [buildPromptEmbed('Delete Ticket', 'Are you sure you want to delete this ticket? This action cannot be undone.')],
-    components: [row],
-    ephemeral: true
-  });
+  await closeTicketWithTranscript(interaction, 'Ticket deleted by staff.');
 }
 
 async function confirmCloseTicket(interaction) {
-  const ticketInfo = getTicketInfoFromChannel(interaction.channel);
-
-  if (!ticketInfo.ownerId || !ticketInfo.type) {
-    await interaction.update({ embeds: [buildPromptEmbed('Invalid Ticket', 'This does not look like a valid ticket channel.')], components: [] });
-    return;
-  }
-
-  await interaction.channel.permissionOverwrites.edit(ticketInfo.ownerId, { ViewChannel: false });
-  await interaction.channel.setName(`closed-${interaction.channel.name.replace(/^ticket-|^closed-/, '')}`).catch(() => {});
-  await updateTicketButtons(interaction.channel, {
-    closed: true,
-    claimed: ticketInfo.claimedBy && ticketInfo.claimedBy !== 'none'
-  });
-
-  await interaction.update({ embeds: [buildPromptEmbed('Ticket Closed', 'Ticket closed. The ticket creator has been removed from the channel.')], components: [] });
+  await closeTicketWithTranscript(interaction, 'Ticket closed by staff.');
 }
 
 async function confirmDeleteTicket(interaction) {
-  await interaction.update({ embeds: [buildPromptEmbed('Deleting Ticket', 'This ticket will be deleted in 3 seconds.')], components: [] });
-  setTimeout(() => interaction.channel.delete().catch(console.error), 3000);
+  await closeTicketWithTranscript(interaction, 'Ticket deleted by staff.');
 }
 
 async function doesVoteMessageStillExist(voteState) {
@@ -2838,6 +2972,7 @@ client.on(Events.InteractionCreate, async interaction => {
       if (interaction.commandName === 'startupvote') return await handleSlashStartupVote(interaction);
       if (interaction.commandName === 'boost') return await handleSlashBoost(interaction);
       if (interaction.commandName === 'staffsessionvote') return await handleStaffSessionVoteCommand(interaction);
+      if (interaction.commandName === 'close') return await closeTicketWithTranscript(interaction, interaction.options.getString('reason', true));
 
       if (interaction.commandName === 'infract') return await handleInfractCommand(interaction);
 
@@ -2892,6 +3027,11 @@ client.on(Events.InteractionCreate, async interaction => {
       if (interaction.customId.startsWith('ticket_modal_')) {
         await createTicketFromModal(interaction);
         return;
+      }
+
+      if (interaction.customId === 'ticket_close_modal') {
+        const reason = interaction.fields.getTextInputValue('close_reason');
+        return await closeTicketWithTranscript(interaction, reason);
       }
     }
 
