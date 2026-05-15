@@ -81,6 +81,9 @@ const STAFF_FEEDBACK_CHANNEL_ID = '1499785829235556555';
 const TRANSCRIPT_LOG_CHANNEL_ID = '1502798480891183224';
 const TRANSCRIPTS_DIR = path.join(__dirname, 'transcripts');
 
+const SESSION_FULL_COOLDOWN_FILE = path.join(__dirname, 'sessionFullCooldown.json');
+const SESSION_FULL_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+
 const RULES_CHANNEL_LINK =
   'https://discord.com/channels/1495947674107777064/1496353783717036173';
 
@@ -202,7 +205,6 @@ const SUPPORT_ROLE_IDS = Object.values(TICKET_TYPES).map(t => t.supportRoleId);
 const activeStartupVotes = new Map();
 const activeStaffSessionVotes = new Map();
 
-let sessionFullSent = false;
 let ssdLockedSent = false;
 let ssuOnlineSent = false;
 let lastLockMessageId = null;
@@ -414,6 +416,16 @@ function writeJson(filePath, data) {
   fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
 }
 
+function readSessionFullCooldown() {
+  return ensureJson(SESSION_FULL_COOLDOWN_FILE, {
+    lastSentAt: 0
+  });
+}
+
+function writeSessionFullCooldown(data) {
+  writeJson(SESSION_FULL_COOLDOWN_FILE, data);
+}
+
 function readInfractions() {
   return ensureJson(INFRACTIONS_FILE, []);
 }
@@ -569,21 +581,26 @@ async function handlePlayerAutomation(players) {
   const lockChannel = await guild.channels.fetch(SSD_LOCK_CHANNEL_ID).catch(() => null);
   const fullChannel = await guild.channels.fetch(SESSION_FULL_CHANNEL_ID).catch(() => null);
 
-  if (players >= 39 && !sessionFullSent) {
-    if (fullChannel && fullChannel.isTextBased()) {
-      await client.rest.post(Routes.channelMessages(fullChannel.id), {
-        body: {
-          flags: IS_COMPONENTS_V2,
-          components: buildSessionFullComponents()
-        }
-      }).catch(console.error);
+  if (players >= 39) {
+    const cooldownData = readSessionFullCooldown();
+    const now = Date.now();
+    const lastSentAt = Number(cooldownData.lastSentAt || 0);
+    const canSendFullAlert = now - lastSentAt >= SESSION_FULL_COOLDOWN_MS;
+
+    if (canSendFullAlert) {
+      if (fullChannel && fullChannel.isTextBased()) {
+        await client.rest.post(Routes.channelMessages(fullChannel.id), {
+          body: {
+            flags: IS_COMPONENTS_V2,
+            components: buildSessionFullComponents()
+          }
+        }).catch(console.error);
+      }
+
+      writeSessionFullCooldown({
+        lastSentAt: now
+      });
     }
-
-    sessionFullSent = true;
-  }
-
-  if (players < 39) {
-    sessionFullSent = false;
   }
 
   if (players >= 3 && !ssuOnlineSent) {
@@ -629,14 +646,6 @@ async function handlePlayerAutomation(players) {
   }
 }
 
-/*
-  Transcript system:
-  - Creates a complete HTML transcript using discord-html-transcripts
-  - Saves the HTML file inside /transcripts
-  - Sends the transcript to the logs channel
-  - DMs the ticket creator with open time, close time, close reason, and the HTML transcript
-  - Deletes the ticket channel after a short delay
-*/
 async function closeTicketWithTranscript(interaction, reason) {
   const channel = interaction.channel;
   const ticketInfo = getTicketInfoFromChannel(channel);
@@ -671,10 +680,6 @@ async function closeTicketWithTranscript(interaction, reason) {
   });
 }
 
-/*
-  Generates transcript and sends it to staff logs and the ticket owner.
-  The transcript includes usernames, timestamps, messages, and attachments.
-*/
 async function generateTranscriptAndCloseChannel({ channel, guild, closedBy, ticketInfo, reason }) {
   const openedAt = Number(ticketInfo.openedAt || channel.createdTimestamp || Date.now());
   const closedAt = Date.now();
@@ -1071,11 +1076,11 @@ function buildStaffSessionVoteComponents(voteCount = 0) {
           content:
             '# Staff Session Vote\n' +
             'Staff members may vote below to decide if a roleplay session should begin.\n\n' +
-            '<:a:1500566566335549580> This vote is for staff only and is available in this channel\n' +
-            ':<:a:1500566566335549580> If you vote here, you must also vote in the Community Session Vote\n' +
-            '<:a:1500566566335549580> Vote based on staff availability and server readiness\n' +
-            '<:a:1500566566335549580> Once enough votes are reached, a decision will be made\n' +
-            '<:a:1500566566335549580> If passed, a session will begin shortly\n' +
+            ':redbulletpoint: This vote is for staff only and is available in this channel\n' +
+            ':redbulletpoint: If you vote here, you must also vote in the Community Session Vote\n' +
+            ':redbulletpoint: Vote based on staff availability and server readiness\n' +
+            ':redbulletpoint: Once enough votes are reached, a decision will be made\n' +
+            ':redbulletpoint: If passed, a session will begin shortly\n' +
             '_ _\n' +
             '-# Staff members use this vote to decide if a roleplay session should begin based on availability and server readiness. Cast your vote below, and once enough votes are reached, the result will determine if a session starts.'
         },
@@ -3137,3 +3142,4 @@ client.on(Events.InteractionCreate, async interaction => {
 });
 
 client.login(process.env.DISCORD_TOKEN);
+
