@@ -84,6 +84,11 @@ const TRANSCRIPTS_DIR = path.join(__dirname, 'transcripts');
 const SESSION_FULL_COOLDOWN_FILE = path.join(__dirname, 'sessionFullCooldown.json');
 const SESSION_FULL_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 
+const SERVER_ONLINE_COOLDOWN_FILE = path.join(__dirname, 'serverOnlineCooldown.json');
+const SERVER_ONLINE_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+
+const GAME_CHAT_MESSAGES_FILE = path.join(__dirname, 'gameChatMessages.json');
+
 const RULES_CHANNEL_LINK =
   'https://discord.com/channels/1495947674107777064/1496353783717036173';
 
@@ -207,7 +212,6 @@ const activeStaffSessionVotes = new Map();
 
 let ssdLockedSent = false;
 let ssuOnlineSent = false;
-let lastLockMessageId = null;
 
 client.once(Events.ClientReady, async readyClient => {
   console.log(`Logged in as ${readyClient.user.tag}`);
@@ -233,6 +237,17 @@ async function registerSlashCommands() {
     { name: 'startupvote', description: 'Start a community session vote.' },
     { name: 'boost', description: 'Send a session boost message.' },
     { name: 'staffsessionvote', description: 'Start a staff session vote.' },
+    {
+      name: 'session',
+      description: 'Session commands.',
+      options: [
+        {
+          name: 'full',
+          description: 'Manually send the session full embed.',
+          type: 1
+        }
+      ]
+    },
     {
       name: 'close',
       description: 'Close the current ticket and create a transcript.',
@@ -417,13 +432,30 @@ function writeJson(filePath, data) {
 }
 
 function readSessionFullCooldown() {
-  return ensureJson(SESSION_FULL_COOLDOWN_FILE, {
-    lastSentAt: 0
-  });
+  return ensureJson(SESSION_FULL_COOLDOWN_FILE, { lastSentAt: 0 });
 }
 
 function writeSessionFullCooldown(data) {
   writeJson(SESSION_FULL_COOLDOWN_FILE, data);
+}
+
+function readServerOnlineCooldown() {
+  return ensureJson(SERVER_ONLINE_COOLDOWN_FILE, { lastSentAt: 0 });
+}
+
+function writeServerOnlineCooldown(data) {
+  writeJson(SERVER_ONLINE_COOLDOWN_FILE, data);
+}
+
+function readGameChatMessages() {
+  return ensureJson(GAME_CHAT_MESSAGES_FILE, {
+    serverOnlineMessageId: null,
+    ssdMessageId: null
+  });
+}
+
+function writeGameChatMessages(data) {
+  writeJson(GAME_CHAT_MESSAGES_FILE, data);
 }
 
 function readInfractions() {
@@ -597,48 +629,75 @@ async function handlePlayerAutomation(players) {
         }).catch(console.error);
       }
 
-      writeSessionFullCooldown({
-        lastSentAt: now
-      });
+      writeSessionFullCooldown({ lastSentAt: now });
     }
   }
 
-  if (players >= 3 && !ssuOnlineSent) {
+  if (players >= 3) {
+    const cooldownData = readServerOnlineCooldown();
+    const gameChatMessages = readGameChatMessages();
+
+    const now = Date.now();
+    const lastSentAt = Number(cooldownData.lastSentAt || 0);
+    const canSendOnlineAlert = now - lastSentAt >= SERVER_ONLINE_COOLDOWN_MS;
+
     if (lockChannel && lockChannel.isTextBased()) {
       await lockChannel.permissionOverwrites.edit(guild.id, {
         SendMessages: true
       }).catch(console.error);
 
-      if (lastLockMessageId) {
-        const oldMsg = await lockChannel.messages.fetch(lastLockMessageId).catch(() => null);
-        if (oldMsg) await oldMsg.delete().catch(() => {});
-        lastLockMessageId = null;
+      if (gameChatMessages.ssdMessageId) {
+        const oldSSD = await lockChannel.messages.fetch(gameChatMessages.ssdMessageId).catch(() => null);
+        if (oldSSD) await oldSSD.delete().catch(() => {});
+        gameChatMessages.ssdMessageId = null;
       }
 
-      await lockChannel.send({
-        embeds: [buildSSUOnlineEmbed()]
-      }).catch(console.error);
+      if (canSendOnlineAlert) {
+        const onlineMsg = await lockChannel.send({
+          embeds: [buildSSUOnlineEmbed()]
+        }).catch(() => null);
+
+        if (onlineMsg) {
+          gameChatMessages.serverOnlineMessageId = onlineMsg.id;
+        }
+
+        writeServerOnlineCooldown({ lastSentAt: now });
+      }
+
+      writeGameChatMessages(gameChatMessages);
     }
 
     ssuOnlineSent = true;
     ssdLockedSent = false;
   }
 
-  if (players < 7) {
+  if (players < 3) {
     ssuOnlineSent = false;
   }
 
   if (players === 0 && !ssdLockedSent) {
+    const gameChatMessages = readGameChatMessages();
+
     if (lockChannel && lockChannel.isTextBased()) {
       await lockChannel.permissionOverwrites.edit(guild.id, {
         SendMessages: false
       }).catch(console.error);
 
+      if (gameChatMessages.serverOnlineMessageId) {
+        const oldOnline = await lockChannel.messages.fetch(gameChatMessages.serverOnlineMessageId).catch(() => null);
+        if (oldOnline) await oldOnline.delete().catch(() => {});
+        gameChatMessages.serverOnlineMessageId = null;
+      }
+
       const msg = await lockChannel.send({
         embeds: [buildSSDEmbed()]
       }).catch(() => null);
 
-      if (msg) lastLockMessageId = msg.id;
+      if (msg) {
+        gameChatMessages.ssdMessageId = msg.id;
+      }
+
+      writeGameChatMessages(gameChatMessages);
     }
 
     ssdLockedSent = true;
@@ -2875,6 +2934,42 @@ async function handleSlashStartupVote(interaction) {
   });
 }
 
+async function handleSessionCommand(interaction) {
+  const subcommand = interaction.options.getSubcommand();
+
+  if (subcommand === 'full') {
+    if (!hasSessionPermission(interaction.member)) {
+      await interaction.reply({
+        content: 'You do not have permission to use this command.',
+        ephemeral: true
+      });
+      return;
+    }
+
+    const fullChannel = await client.channels.fetch(SESSION_FULL_CHANNEL_ID).catch(() => null);
+
+    if (!fullChannel || !fullChannel.isTextBased()) {
+      await interaction.reply({
+        content: 'Session full channel was not found.',
+        ephemeral: true
+      });
+      return;
+    }
+
+    await client.rest.post(Routes.channelMessages(fullChannel.id), {
+      body: {
+        flags: IS_COMPONENTS_V2,
+        components: buildSessionFullComponents()
+      }
+    });
+
+    await interaction.reply({
+      content: 'Session full embed sent.',
+      ephemeral: true
+    });
+  }
+}
+
 client.on(Events.MessageDelete, message => {
   if (!message.guild) return;
 
@@ -2977,6 +3072,7 @@ client.on(Events.InteractionCreate, async interaction => {
       if (interaction.commandName === 'startupvote') return await handleSlashStartupVote(interaction);
       if (interaction.commandName === 'boost') return await handleSlashBoost(interaction);
       if (interaction.commandName === 'staffsessionvote') return await handleStaffSessionVoteCommand(interaction);
+      if (interaction.commandName === 'session') return await handleSessionCommand(interaction);
       if (interaction.commandName === 'close') return await closeTicketWithTranscript(interaction, interaction.options.getString('reason', true));
 
       if (interaction.commandName === 'infract') return await handleInfractCommand(interaction);
@@ -3142,4 +3238,3 @@ client.on(Events.InteractionCreate, async interaction => {
 });
 
 client.login(process.env.DISCORD_TOKEN);
-
