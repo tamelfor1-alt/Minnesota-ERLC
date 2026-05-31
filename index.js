@@ -801,7 +801,7 @@ async function closeTicketWithTranscript(interaction, reason) {
 
   if (!canUseTicketCommand(interaction, ticketInfo)) {
     await interaction.reply({
-      content: 'You do not have permission to close this ticket.',
+      content: 'You do not have the proper permissions to close this ticket.',
       ephemeral: true
     });
     return;
@@ -3572,4 +3572,3 @@ client.on(Events.InteractionCreate, async interaction => {
 });
 
 client.login(process.env.DISCORD_TOKEN);
-
