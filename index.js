@@ -3,6 +3,7 @@ require('dotenv').config();
 
 const fs = require('fs');
 const path = require('path');
+const express = require('express');
 const { createTranscript } = require('discord-html-transcripts');
 
 const {
@@ -87,6 +88,8 @@ const STAFF_FEEDBACK_CHANNEL_ID = '1499785829235556555';
 
 const TRANSCRIPT_LOG_CHANNEL_ID = '1502798480891183224';
 const TRANSCRIPTS_DIR = path.join(__dirname, 'transcripts');
+const WEBSITE_PORT = Number(process.env.WEBSITE_PORT || process.env.PORT || 3000);
+const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || `http://localhost:${WEBSITE_PORT}`).replace(/\/$/, '');
 
 const SESSION_FULL_COOLDOWN_FILE = path.join(__dirname, 'sessionFullCooldown.json');
 const SESSION_FULL_COOLDOWN_MS = 24 * 60 * 60 * 1000;
@@ -238,6 +241,7 @@ let ssuOnlineSent = false;
 
 client.once(Events.ClientReady, async readyClient => {
   console.log(`Logged in as ${readyClient.user.tag}`);
+  startTranscriptWebsite();
 
   await registerSlashCommands().catch(console.error);
 
@@ -787,6 +791,64 @@ async function handlePlayerAutomation(players) {
   }
 }
 
+
+function getTranscriptUrl(fileName) {
+  return `${PUBLIC_BASE_URL}/transcripts/${encodeURIComponent(fileName)}`;
+}
+
+function buildTranscriptButtonRow(transcriptUrl) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setLabel('View Transcript')
+      .setStyle(ButtonStyle.Link)
+      .setURL(transcriptUrl)
+  );
+}
+
+function startTranscriptWebsite() {
+  const app = express();
+
+  if (!fs.existsSync(TRANSCRIPTS_DIR)) {
+    fs.mkdirSync(TRANSCRIPTS_DIR, { recursive: true });
+  }
+
+  app.get('/', (req, res) => {
+    res.send(`
+      <!doctype html>
+      <html>
+        <head>
+          <meta charset="utf-8" />
+          <meta name="viewport" content="width=device-width, initial-scale=1" />
+          <title>Minnesota Ticket Transcripts</title>
+          <style>
+            body { margin: 0; background: #0f1117; color: white; font-family: Arial, sans-serif; }
+            main { max-width: 900px; margin: 60px auto; padding: 24px; }
+            a { color: #ff4d4d; }
+            .card { background: #171923; border: 1px solid #2b2f3a; border-radius: 14px; padding: 22px; }
+          </style>
+        </head>
+        <body>
+          <main>
+            <div class="card">
+              <h1>Minnesota Ticket Transcripts</h1>
+              <p>This website is running. Transcript links are created when tickets close.</p>
+            </div>
+          </main>
+        </body>
+      </html>
+    `);
+  });
+
+  app.use('/transcripts', express.static(TRANSCRIPTS_DIR, {
+    extensions: ['html'],
+    index: false
+  }));
+
+  app.listen(WEBSITE_PORT, () => {
+    console.log(`Transcript website running at ${PUBLIC_BASE_URL}`);
+  });
+}
+
 async function closeTicketWithTranscript(interaction, reason) {
   const channel = interaction.channel;
   const ticketInfo = getTicketInfoFromChannel(channel);
@@ -801,7 +863,7 @@ async function closeTicketWithTranscript(interaction, reason) {
 
   if (!canUseTicketCommand(interaction, ticketInfo)) {
     await interaction.reply({
-      content: 'You do not have the proper permissions to close this ticket.',
+      content: 'You do not have permission to close this ticket.',
       ephemeral: true
     });
     return;
@@ -832,6 +894,8 @@ async function generateTranscriptAndCloseChannel({ channel, guild, closedBy, tic
   const safeChannelName = channel.name.replace(/[^a-zA-Z0-9-_]/g, '-');
   const transcriptFileName = `${safeChannelName}-${channel.id}.html`;
   const transcriptFilePath = path.join(TRANSCRIPTS_DIR, transcriptFileName);
+  const transcriptUrl = getTranscriptUrl(transcriptFileName);
+  const transcriptButtonRow = buildTranscriptButtonRow(transcriptUrl);
 
   let transcriptBuffer;
 
@@ -861,6 +925,7 @@ async function generateTranscriptAndCloseChannel({ channel, guild, closedBy, tic
       { name: 'Closed By:', value: `${closedBy}`, inline: true },
       { name: 'Opened:', value: `<t:${Math.floor(openedAt / 1000)}:F>`, inline: true },
       { name: 'Closed:', value: `<t:${Math.floor(closedAt / 1000)}:F>`, inline: true },
+      { name: 'Transcript URL:', value: `[Open transcript](${transcriptUrl})`, inline: false },
       { name: 'Reason:', value: reason || 'No reason provided.', inline: false }
     );
 
@@ -869,6 +934,7 @@ async function generateTranscriptAndCloseChannel({ channel, guild, closedBy, tic
   if (logsChannel && logsChannel.isTextBased()) {
     await logsChannel.send({
       embeds: [transcriptEmbed],
+      components: [transcriptButtonRow],
       files: [new AttachmentBuilder(transcriptFilePath, { name: transcriptFileName })]
     }).catch(console.error);
   }
@@ -879,16 +945,18 @@ async function generateTranscriptAndCloseChannel({ channel, guild, closedBy, tic
     const dmEmbed = new EmbedBuilder()
       .setColor('#da242e')
       .setTitle('Your Ticket Has Been Closed')
-      .setDescription('Your ticket has been closed. A transcript of the ticket is attached below.')
+.setDescription('Your ticket has been closed. Click the button below to view the Discord-style HTML transcript.')
       .addFields(
         { name: 'Opened:', value: `<t:${Math.floor(openedAt / 1000)}:F>`, inline: true },
         { name: 'Closed:', value: `<t:${Math.floor(closedAt / 1000)}:F>`, inline: true },
         { name: 'Closed By:', value: `${closedBy}`, inline: true },
+        { name: 'Transcript URL:', value: `[Open transcript](${transcriptUrl})`, inline: false },
         { name: 'Reason:', value: reason || 'No reason provided.', inline: false }
       );
 
     await ticketCreator.send({
       embeds: [dmEmbed],
+      components: [transcriptButtonRow],
       files: [new AttachmentBuilder(transcriptFilePath, { name: transcriptFileName })]
     }).catch(() => {});
   }
