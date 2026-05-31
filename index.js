@@ -106,6 +106,7 @@ const INFRACTIONS_FILE = path.join(__dirname, 'infractions.json');
 const TRAINING_FILE = path.join(__dirname, 'training.json');
 const SUGGESTIONS_FILE = path.join(__dirname, 'suggestions.json');
 const GIVEAWAYS_FILE = path.join(__dirname, 'giveaways.json');
+const TICKETS_FILE = path.join(__dirname, 'tickets.json');
 
 const SHUTDOWN_BANNER_URL =
   'https://media.discordapp.net/attachments/1393378962364956783/1393379706010603561/minstate.png?ex=69e80df9&is=69e6bc79&hm=9a969d61bc57a226c34a59ebca0ccf4fe68a54253eeec72ce7b709aa2770df98&=&format=webp&quality=lossless&width=1860&height=94';
@@ -579,6 +580,14 @@ function writeGiveaways(data) {
   writeJson(GIVEAWAYS_FILE, data);
 }
 
+function readTickets() {
+  return ensureJson(TICKETS_FILE, {});
+}
+
+function writeTickets(data) {
+  writeJson(TICKETS_FILE, data);
+}
+
 function createInfractionId() {
   return `${Date.now()}${Math.floor(Math.random() * 9999)}`;
 }
@@ -849,6 +858,192 @@ function startTranscriptWebsite() {
   });
 }
 
+
+function escapeHtml(text) {
+  return String(text ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function formatTranscriptMentions(text, guild) {
+  return escapeHtml(text)
+    .replace(/&lt;@!?(\d+)&gt;/g, (match, id) => {
+      const member = guild.members.cache.get(id);
+      const username = member?.user?.username || `user-${id}`;
+      return `<span class="mention">@${escapeHtml(username)}(${id})</span>`;
+    })
+    .replace(/&lt;@&(\d+)&gt;/g, (match, id) => {
+      const role = guild.roles.cache.get(id);
+      return `<span class="mention">@${escapeHtml(role?.name || `role-${id}`)}(${id})</span>`;
+    })
+    .replace(/&lt;#(\d+)&gt;/g, (match, id) => {
+      const mentionedChannel = guild.channels.cache.get(id);
+      return `<span class="mention">#${escapeHtml(mentionedChannel?.name || `channel-${id}`)}(${id})</span>`;
+    });
+}
+
+async function fetchAllChannelMessages(channel) {
+  const allMessages = [];
+  let before;
+
+  while (true) {
+    const options = { limit: 100 };
+    if (before) options.before = before;
+
+    const messages = await channel.messages.fetch(options);
+    if (!messages.size) break;
+
+    allMessages.push(...messages.values());
+    before = messages.last().id;
+
+    if (messages.size < 100) break;
+  }
+
+  return allMessages.sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+}
+
+function renderTranscriptEmbed(embed, guild) {
+  const fields = (embed.fields || []).map(field => `
+    <div class="embed-field">
+      <div class="embed-field-name">${escapeHtml(field.name)}</div>
+      <div class="embed-field-value">${formatTranscriptMentions(field.value, guild)}</div>
+    </div>
+  `).join('');
+
+  return `
+    <div class="discord-embed">
+      ${embed.author?.name ? `<div class="embed-author">${escapeHtml(embed.author.name)}</div>` : ''}
+      ${embed.title ? `<div class="embed-title">${escapeHtml(embed.title)}</div>` : ''}
+      ${embed.description ? `<div class="embed-description">${formatTranscriptMentions(embed.description, guild)}</div>` : ''}
+      ${fields}
+      ${embed.thumbnail?.url ? `<img class="embed-thumbnail" src="${escapeHtml(embed.thumbnail.url)}" alt="thumbnail">` : ''}
+      ${embed.image?.url ? `<img class="embed-image" src="${escapeHtml(embed.image.url)}" alt="embed image">` : ''}
+      ${embed.footer?.text ? `<div class="embed-footer">${escapeHtml(embed.footer.text)}</div>` : ''}
+    </div>
+  `;
+}
+
+async function createCustomTranscriptHtml(channel, ticketInfo, closedBy, closeReason, openedAt, closedAt) {
+  const messages = await fetchAllChannelMessages(channel);
+
+  const htmlMessages = messages.map(message => {
+    const author = message.author?.tag || 'Unknown User';
+    const username = message.author?.username || 'Unknown';
+    const userId = message.author?.id || 'unknown';
+    const avatar = message.author?.displayAvatarURL?.({ extension: 'png', size: 64 }) || '';
+    const time = new Date(message.createdTimestamp).toLocaleString();
+
+    const content = message.content
+      ? `<div class="message-content">${formatTranscriptMentions(message.content, channel.guild)}</div>`
+      : '';
+
+    const embeds = message.embeds.map(embed => renderTranscriptEmbed(embed, channel.guild)).join('');
+
+    const attachments = [...message.attachments.values()].map(file => {
+      const isImage = file.contentType?.startsWith('image/') || /\.(png|jpe?g|gif|webp)$/i.test(file.url);
+      return `
+        <div class="attachment">
+          <a href="${escapeHtml(file.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(file.name || file.url)}</a>
+          ${isImage ? `<br><img class="attachment-image" src="${escapeHtml(file.url)}" alt="${escapeHtml(file.name || 'attachment')}">` : ''}
+        </div>
+      `;
+    }).join('');
+
+    const stickers = [...message.stickers.values()].map(sticker => `
+      <div class="sticker">Sticker: ${escapeHtml(sticker.name || sticker.id)}</div>
+    `).join('');
+
+    const reactions = [...message.reactions.cache.values()].map(reaction => `
+      <span class="reaction">${escapeHtml(reaction.emoji?.name || 'reaction')} ${reaction.count}</span>
+    `).join('');
+
+    return `
+      <div class="message">
+        <img class="avatar" src="${escapeHtml(avatar)}" alt="">
+        <div class="message-body">
+          <div class="message-header">
+            <span class="author">${escapeHtml(author)}</span>
+            <span class="user-id">(${escapeHtml(userId)})</span>
+            <span class="timestamp">${escapeHtml(time)}</span>
+          </div>
+          ${content}
+          ${embeds}
+          ${attachments}
+          ${stickers}
+          ${reactions ? `<div class="reactions">${reactions}</div>` : ''}
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  return Buffer.from(`
+    <!doctype html>
+    <html>
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Transcript - ${escapeHtml(channel.name)}</title>
+        <style>
+          :root { color-scheme: dark; }
+          body { margin:0; background:#313338; color:#dbdee1; font-family: Arial, Helvetica, sans-serif; }
+          .container { max-width: 980px; margin: 0 auto; padding: 32px 20px; }
+          .header { background:#2b2d31; border:1px solid #3f4147; border-radius:14px; padding:22px; margin-bottom:22px; }
+          h1 { margin:0 0 14px; color:#fff; font-size:28px; }
+          .meta-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap:10px; }
+          .meta { background:#232428; border-radius:10px; padding:10px 12px; }
+          .meta-label { color:#949ba4; font-size:12px; text-transform:uppercase; letter-spacing:.04em; margin-bottom:4px; }
+          .meta-value { color:#f2f3f5; white-space:pre-wrap; overflow-wrap:anywhere; }
+          .message { display:flex; gap:14px; padding: 10px 4px; }
+          .message:hover { background:rgba(43,45,49,.55); }
+          .avatar { width:40px; height:40px; border-radius:50%; flex:0 0 auto; background:#232428; }
+          .message-body { min-width:0; flex:1; }
+          .message-header { margin-bottom:4px; }
+          .author { font-weight:700; color:#fff; }
+          .user-id, .timestamp { color:#949ba4; font-size:12px; margin-left:6px; }
+          .message-content { white-space:pre-wrap; overflow-wrap:anywhere; line-height:1.35; }
+          .mention { color:#c9cdfb; background:#3c4270; border-radius:3px; padding:0 3px; font-weight:600; }
+          .discord-embed { position:relative; background:#2b2d31; border-left:4px solid #5865f2; border-radius:6px; margin-top:8px; padding:12px; max-width:650px; overflow-wrap:anywhere; }
+          .embed-author { font-size:13px; font-weight:700; color:#fff; margin-bottom:6px; }
+          .embed-title { font-weight:700; color:#fff; margin-bottom:6px; }
+          .embed-description { white-space:pre-wrap; line-height:1.35; }
+          .embed-field { margin-top:10px; }
+          .embed-field-name { color:#fff; font-weight:700; font-size:14px; }
+          .embed-field-value { white-space:pre-wrap; margin-top:2px; }
+          .embed-thumbnail { max-width:120px; border-radius:6px; margin-top:10px; }
+          .embed-image, .attachment-image { max-width:520px; max-height:420px; width:auto; height:auto; border-radius:8px; margin-top:10px; display:block; }
+          .embed-footer { color:#949ba4; font-size:12px; margin-top:10px; }
+          .attachment { margin-top:8px; }
+          a { color:#00a8fc; text-decoration:none; }
+          a:hover { text-decoration:underline; }
+          .sticker { margin-top:8px; color:#b5bac1; font-style:italic; }
+          .reaction { display:inline-block; background:#2b2d31; border:1px solid #3f4147; border-radius:999px; padding:3px 8px; margin:6px 6px 0 0; font-size:13px; }
+        </style>
+      </head>
+      <body>
+        <main class="container">
+          <section class="header">
+            <h1># ${escapeHtml(channel.name)}</h1>
+            <div class="meta-grid">
+              <div class="meta"><div class="meta-label">Discord Username</div><div class="meta-value">${escapeHtml(ticketInfo.discordUsername || 'Unknown')}</div></div>
+              <div class="meta"><div class="meta-label">Discord ID</div><div class="meta-value">${escapeHtml(ticketInfo.ownerId || 'Unknown')}</div></div>
+              <div class="meta"><div class="meta-label">Roblox Username</div><div class="meta-value">${escapeHtml(ticketInfo.robloxUsername || 'Not provided')}</div></div>
+              <div class="meta"><div class="meta-label">Opened</div><div class="meta-value">${escapeHtml(new Date(openedAt).toLocaleString())}</div></div>
+              <div class="meta"><div class="meta-label">Closed</div><div class="meta-value">${escapeHtml(new Date(closedAt).toLocaleString())}</div></div>
+              <div class="meta"><div class="meta-label">Closed By</div><div class="meta-value">${escapeHtml(closedBy?.tag || closedBy?.username || String(closedBy))}</div></div>
+              <div class="meta"><div class="meta-label">Opening Reason</div><div class="meta-value">${escapeHtml(ticketInfo.issueDetails || 'No opening reason provided.')}</div></div>
+              <div class="meta"><div class="meta-label">Close Reason</div><div class="meta-value">${escapeHtml(closeReason || 'No close reason provided.')}</div></div>
+            </div>
+          </section>
+          ${htmlMessages || '<p>No messages were found in this ticket.</p>'}
+        </main>
+      </body>
+    </html>
+  `);
+}
+
 async function closeTicketWithTranscript(interaction, reason) {
   const channel = interaction.channel;
   const ticketInfo = getTicketInfoFromChannel(channel);
@@ -900,17 +1095,11 @@ async function generateTranscriptAndCloseChannel({ channel, guild, closedBy, tic
   let transcriptBuffer;
 
   try {
-    transcriptBuffer = await createTranscript(channel, {
-      limit: -1,
-      returnType: 'buffer',
-      filename: transcriptFileName,
-      saveImages: true,
-      poweredBy: false
-    });
+    transcriptBuffer = await createCustomTranscriptHtml(channel, ticketInfo, closedBy, reason, openedAt, closedAt);
   } catch (error) {
     console.error('Transcript creation failed:', error);
     transcriptBuffer = Buffer.from(
-      `<html><body><h1>Transcript Failed</h1><p>Could not create transcript for ${channel.name}.</p></body></html>`
+      `<!doctype html><html><body><h1>Transcript Failed</h1><p>Could not create transcript for ${escapeHtml(channel.name)}.</p></body></html>`
     );
   }
 
@@ -923,10 +1112,14 @@ async function generateTranscriptAndCloseChannel({ channel, guild, closedBy, tic
       { name: 'Ticket Channel:', value: `${channel.name}`, inline: true },
       { name: 'Ticket Creator:', value: `<@${ticketInfo.ownerId}>`, inline: true },
       { name: 'Closed By:', value: `${closedBy}`, inline: true },
+      { name: 'Discord Username:', value: ticketInfo.discordUsername || 'Unknown Discord user', inline: true },
+      { name: 'Discord ID:', value: ticketInfo.ownerId || 'Unknown', inline: true },
+      { name: 'Roblox Username:', value: ticketInfo.robloxUsername || 'Not provided', inline: true },
       { name: 'Opened:', value: `<t:${Math.floor(openedAt / 1000)}:F>`, inline: true },
       { name: 'Closed:', value: `<t:${Math.floor(closedAt / 1000)}:F>`, inline: true },
       { name: 'Transcript URL:', value: `[Open transcript](${transcriptUrl})`, inline: false },
-      { name: 'Reason:', value: reason || 'No reason provided.', inline: false }
+      { name: 'Opening Reason:', value: ticketInfo.issueDetails || 'No opening reason provided.', inline: false },
+      { name: 'Close Reason:', value: reason || 'No close reason provided.', inline: false }
     );
 
   const logsChannel = await client.channels.fetch(TRANSCRIPT_LOG_CHANNEL_ID).catch(() => null);
@@ -945,13 +1138,17 @@ async function generateTranscriptAndCloseChannel({ channel, guild, closedBy, tic
     const dmEmbed = new EmbedBuilder()
       .setColor('#da242e')
       .setTitle('Your Ticket Has Been Closed')
-.setDescription('Your ticket has been closed. Click the button below to view the Discord-style HTML transcript.')
+      .setDescription('Your ticket has been closed. Click the button below to view the Discord-style HTML transcript.')
       .addFields(
+        { name: 'Discord Username:', value: ticketInfo.discordUsername || 'Unknown Discord user', inline: true },
+        { name: 'Discord ID:', value: ticketInfo.ownerId || 'Unknown', inline: true },
+        { name: 'Roblox Username:', value: ticketInfo.robloxUsername || 'Not provided', inline: true },
         { name: 'Opened:', value: `<t:${Math.floor(openedAt / 1000)}:F>`, inline: true },
         { name: 'Closed:', value: `<t:${Math.floor(closedAt / 1000)}:F>`, inline: true },
         { name: 'Closed By:', value: `${closedBy}`, inline: true },
         { name: 'Transcript URL:', value: `[Open transcript](${transcriptUrl})`, inline: false },
-        { name: 'Reason:', value: reason || 'No reason provided.', inline: false }
+        { name: 'Opening Reason:', value: ticketInfo.issueDetails || 'No opening reason provided.', inline: false },
+        { name: 'Close Reason:', value: reason || 'No close reason provided.', inline: false }
       );
 
     await ticketCreator.send({
@@ -965,7 +1162,13 @@ async function generateTranscriptAndCloseChannel({ channel, guild, closedBy, tic
     embeds: [
       buildPromptEmbed(
         'Ticket Closed',
-        `This ticket has been closed by ${closedBy}.\n\n**Reason:** ${reason || 'No reason provided.'}\n\nTranscript has been saved. This channel will be deleted shortly.`
+        `This ticket has been closed by ${closedBy}.\n\n` +
+        `**Discord Username:** ${ticketInfo.discordUsername || 'Unknown Discord user'}\n` +
+        `**Discord ID:** ${ticketInfo.ownerId || 'Unknown'}\n` +
+        `**Roblox Username:** ${ticketInfo.robloxUsername || 'Not provided'}\n` +
+        `**Opening Reason:** ${ticketInfo.issueDetails || 'No opening reason provided.'}\n` +
+        `**Close Reason:** ${reason || 'No close reason provided.'}\n\n` +
+        `Transcript has been saved. This channel will be deleted shortly.`
       )
     ]
   }).catch(() => {});
@@ -2859,23 +3062,51 @@ async function updatePermanentInfoMessage() {
   );
 }
 
+function decodeTicketTopicValue(value) {
+  if (!value) return null;
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function encodeTicketTopicValue(value) {
+  return encodeURIComponent(String(value || ''));
+}
+
 function getTicketInfoFromChannel(channel) {
   const topic = channel.topic || '';
   const ownerMatch = topic.match(/ticketOwner:(\d+)/);
   const typeMatch = topic.match(/ticketType:([a-z]+)/);
   const claimedMatch = topic.match(/claimedBy:(\d+|none)/);
   const openedAtMatch = topic.match(/openedAt:(\d+)/);
+  const robloxMatch = topic.match(/roblox:([^|]+)/);
+  const issueMatch = topic.match(/issue:([^|]+)/);
+  const discordTagMatch = topic.match(/discordTag:([^|]+)/);
+
+  const savedTickets = readTickets();
+  const savedTicket = savedTickets[channel.id] || {};
 
   return {
-    ownerId: ownerMatch ? ownerMatch[1] : null,
-    type: typeMatch ? typeMatch[1] : null,
-    claimedBy: claimedMatch ? claimedMatch[1] : 'none',
-    openedAt: openedAtMatch ? openedAtMatch[1] : null
+    ownerId: savedTicket.ownerId || (ownerMatch ? ownerMatch[1] : null),
+    type: savedTicket.type || (typeMatch ? typeMatch[1] : null),
+    claimedBy: claimedMatch ? claimedMatch[1] : (savedTicket.claimedBy || 'none'),
+    openedAt: savedTicket.openedAt || (openedAtMatch ? openedAtMatch[1] : null),
+    robloxUsername: savedTicket.robloxUsername || decodeTicketTopicValue(robloxMatch?.[1]) || 'Not provided',
+    issueDetails: savedTicket.issueDetails || decodeTicketTopicValue(issueMatch?.[1]) || 'No opening reason provided.',
+    discordUsername: savedTicket.discordUsername || decodeTicketTopicValue(discordTagMatch?.[1]) || 'Unknown Discord user'
   };
 }
 
-function buildTicketTopic(ownerId, type, claimedBy = 'none', openedAt = Date.now()) {
-  return `ticketOwner:${ownerId} | ticketType:${type} | claimedBy:${claimedBy} | openedAt:${openedAt}`;
+function buildTicketTopic(ownerId, type, claimedBy = 'none', openedAt = Date.now(), robloxUsername = '', issueDetails = '', discordUsername = '') {
+  const shortIssue = String(issueDetails || '').slice(0, 250);
+  return (
+    `ticketOwner:${ownerId} | ticketType:${type} | claimedBy:${claimedBy} | openedAt:${openedAt}` +
+    ` | roblox:${encodeTicketTopicValue(robloxUsername)}` +
+    ` | discordTag:${encodeTicketTopicValue(discordUsername)}` +
+    ` | issue:${encodeTicketTopicValue(shortIssue)}`
+  ).slice(0, 1000);
 }
 
 async function findExistingTicket(guild, userId) {
@@ -2946,7 +3177,7 @@ async function createTicketFromModal(interaction) {
     name: `ticket-${safeName}`,
     type: ChannelType.GuildText,
     parent: config.categoryId,
-    topic: buildTicketTopic(interaction.user.id, ticketType, 'none', openedAt),
+    topic: buildTicketTopic(interaction.user.id, ticketType, 'none', openedAt, robloxUsername, issueDetails, interaction.user.tag),
     permissionOverwrites: [
       { id: interaction.guild.id, deny: [PermissionFlagsBits.ViewChannel] },
       {
@@ -2968,6 +3199,19 @@ async function createTicketFromModal(interaction) {
 }))
     ]
   });
+
+  const tickets = readTickets();
+  tickets[ticketChannel.id] = {
+    channelId: ticketChannel.id,
+    ownerId: interaction.user.id,
+    type: ticketType,
+    claimedBy: 'none',
+    openedAt,
+    robloxUsername,
+    issueDetails,
+    discordUsername: interaction.user.tag
+  };
+  writeTickets(tickets);
 
   await interaction.reply({ content: `Your ticket has been created: ${ticketChannel}`, ephemeral: true });
   await ticketChannel.send({ content: `${interaction.user}` });
@@ -3096,7 +3340,7 @@ async function handleClaimTicket(interaction) {
     ReadMessageHistory: true
   });
 
-  await channel.setTopic(buildTicketTopic(ticketInfo.ownerId, ticketInfo.type, interaction.user.id, ticketInfo.openedAt || Date.now()));
+  await channel.setTopic(buildTicketTopic(ticketInfo.ownerId, ticketInfo.type, interaction.user.id, ticketInfo.openedAt || Date.now(), ticketInfo.robloxUsername, ticketInfo.issueDetails, ticketInfo.discordUsername));
   await updateTicketButtons(channel, { closed: false, claimed: true });
 
   await interaction.reply({ embeds: [buildPromptEmbed('Ticket Claimed', `This ticket has been claimed by ${interaction.user}.`)] });
@@ -3133,7 +3377,7 @@ for (const roleId of config.supportRoleIds) {
   }).catch(() => {});
 }
 
-  await channel.setTopic(buildTicketTopic(ticketInfo.ownerId, ticketInfo.type, 'none', ticketInfo.openedAt || Date.now()));
+  await channel.setTopic(buildTicketTopic(ticketInfo.ownerId, ticketInfo.type, 'none', ticketInfo.openedAt || Date.now(), ticketInfo.robloxUsername, ticketInfo.issueDetails, ticketInfo.discordUsername));
   await updateTicketButtons(channel, { closed: false, claimed: false });
 
   await interaction.reply({ embeds: [buildPromptEmbed('Ticket Unclaimed', `This ticket has been unclaimed by ${interaction.user}.`)] });
@@ -3184,7 +3428,7 @@ for (const roleId of config.supportRoleIds) {
   }).catch(() => {});
 }
 
-  await interaction.channel.setTopic(buildTicketTopic(ticketInfo.ownerId, ticketInfo.type, 'none', ticketInfo.openedAt || Date.now()));
+  await interaction.channel.setTopic(buildTicketTopic(ticketInfo.ownerId, ticketInfo.type, 'none', ticketInfo.openedAt || Date.now(), ticketInfo.robloxUsername, ticketInfo.issueDetails, ticketInfo.discordUsername));
   await interaction.channel.setName(`ticket-${interaction.channel.name.replace(/^ticket-|^closed-/, '')}`).catch(() => {});
   await updateTicketButtons(interaction.channel, { closed: false, claimed: false });
 
